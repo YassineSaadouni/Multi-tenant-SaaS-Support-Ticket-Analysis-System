@@ -18,7 +18,7 @@ router = APIRouter()
 
 @router.get("/tickets", response_model=List[TicketResponse])
 async def list_tickets(
-    tenant_id: str,
+    tenant_id: str = Query(..., description="Tenant ID - REQUIRED for data isolation"),
     status: Optional[str] = None,
     urgency: Optional[str] = None,
     source: Optional[str] = None,
@@ -28,6 +28,8 @@ async def list_tickets(
     """
     List tickets with resource-aware pagination.
     
+    Security: ALWAYS filtered by tenant_id to prevent cross-tenant data leakage.
+    
     Resource Management:
     - Page size capped at MAX_PAGE_SIZE to prevent memory exhaustion
     - Query timeout enforced
@@ -35,23 +37,25 @@ async def list_tickets(
     """
     db = await get_db()
     
+    # CRITICAL SECURITY: Validate tenant_id is not empty
+    if not tenant_id or not tenant_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="tenant_id is required and cannot be empty"
+        )
+    
     # Enforce max page size limit
     if page_size > settings.MAX_PAGE_SIZE:
         page_size = settings.MAX_PAGE_SIZE
     
-    query: dict = {}
-
     # ============================================================
-    # 🐛 DEBUG TASK A: Multi-tenant isolation bug - FIXED
-    # The tenant_id filter is missing here.
-    # This can expose tickets that belong to other tenants.
+    # SECURITY: Multi-tenant isolation - ALWAYS filter by tenant_id
+    # tenant_id MUST be the first filter applied
     # ============================================================
-    # Apply tenant isolation
-    if tenant_id:
-        query["tenant_id"] = tenant_id
-    
-    # Exclude soft-deleted tickets
-    query["deleted_at"] = {"$exists": False}
+    query: dict = {
+        "tenant_id": tenant_id,  # REQUIRED - never optional
+        "deleted_at": {"$exists": False}  # Exclude soft-deleted tickets
+    }
     
     if status:
         query["status"] = status
@@ -67,6 +71,12 @@ async def list_tickets(
             max_time_ms=settings.DEFAULT_QUERY_TIMEOUT_MS
         ).skip((page - 1) * page_size).limit(page_size)
         docs = await cursor.to_list(length=page_size)
+        
+        # Convert MongoDB documents to Pydantic models
+        for doc in docs:
+            doc["_id"] = str(doc["_id"])
+            doc["id"] = doc["external_id"]  # Map external_id to id for response model
+        
         return docs
     except Exception as e:
         raise HTTPException(
@@ -76,15 +86,95 @@ async def list_tickets(
 
 
 @router.get("/tickets/urgent", response_model=List[TicketResponse])
-async def list_urgent_tickets(tenant_id: str):
-    # TODO: Implement fetching urgent tickets for a tenant
-    return []
+async def list_urgent_tickets(
+    tenant_id: str = Query(..., description="Tenant ID - REQUIRED for data isolation")
+):
+    """
+    List urgent tickets for a tenant.
+    
+    Security: ALWAYS filtered by tenant_id to prevent cross-tenant data leakage.
+    """
+    db = await get_db()
+    
+    # CRITICAL SECURITY: Validate tenant_id
+    if not tenant_id or not tenant_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="tenant_id is required and cannot be empty"
+        )
+    
+    try:
+        cursor = db.tickets.find(
+            {
+                "tenant_id": tenant_id,  # REQUIRED - never optional
+                "urgency": "high",
+                "deleted_at": {"$exists": False}
+            },
+            max_time_ms=settings.DEFAULT_QUERY_TIMEOUT_MS
+        ).limit(settings.MAX_PAGE_SIZE)
+        
+        docs = await cursor.to_list(length=settings.MAX_PAGE_SIZE)
+        
+        # Convert MongoDB documents to Pydantic models
+        for doc in docs:
+            doc["_id"] = str(doc["_id"])
+            doc["id"] = doc["external_id"]
+        
+        return docs
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed: {str(e)}"
+        )
 
 
 @router.get("/tickets/{ticket_id}", response_model=TicketResponse)
-async def get_ticket(ticket_id: str, tenant_id: str):
-    # TODO: Implement fetching a single ticket
-    return None
+async def get_ticket(
+    ticket_id: str,
+    tenant_id: str = Query(..., description="Tenant ID - REQUIRED for data isolation")
+):
+    """
+    Get a single ticket by ID.
+    
+    Security: ALWAYS validates tenant_id matches to prevent cross-tenant access.
+    """
+    db = await get_db()
+    
+    # CRITICAL SECURITY: Validate tenant_id
+    if not tenant_id or not tenant_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="tenant_id is required and cannot be empty"
+        )
+    
+    try:
+        ticket = await db.tickets.find_one(
+            {
+                "_id": ticket_id,
+                "tenant_id": tenant_id,  # REQUIRED - prevent cross-tenant access
+                "deleted_at": {"$exists": False}
+            },
+            max_time_ms=settings.DEFAULT_QUERY_TIMEOUT_MS
+        )
+        
+        if not ticket:
+            raise HTTPException(
+                status_code=404,
+                detail="Ticket not found or access denied"
+            )
+        
+        # Convert MongoDB document to Pydantic model
+        ticket["_id"] = str(ticket["_id"])
+        ticket["id"] = ticket["external_id"]
+        
+        return ticket
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed: {str(e)}"
+        )
 
 
 # ============================================================
