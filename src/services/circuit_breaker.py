@@ -132,6 +132,11 @@ class CircuitBreaker:
             self._success_count += 1
             self._recent_results.append(True)
             
+            # Prevent unbounded counter growth (memory leak fix)
+            # Reset counters when they exceed a threshold
+            if self._success_count > 100000:
+                self._success_count = 0
+            
             # HALF_OPEN → CLOSED on success
             if self._state == CircuitState.HALF_OPEN:
                 self._state = CircuitState.CLOSED
@@ -146,6 +151,10 @@ class CircuitBreaker:
             self._failure_count += 1
             self._recent_results.append(False)
             self._last_failure_time = time.time()
+            
+            # Prevent unbounded counter growth (memory leak fix)
+            if self._failure_count > 100000:
+                self._failure_count = len([r for r in self._recent_results if not r])
             
             # HALF_OPEN → OPEN immediately on failure
             if self._state == CircuitState.HALF_OPEN:

@@ -24,13 +24,33 @@ class RateLimiter:
     Sliding window rate limiter.
 
     Limits the number of allowed requests per minute.
+    
+    Memory management:
+    - Uses deque with maxlen to prevent unbounded growth
+    - Cleans expired entries during acquire()
     """
 
     def __init__(self, requests_per_minute: int = 60):
         self.requests_per_minute = requests_per_minute
         self.window_seconds = 60
-        self.request_times: deque = deque()
+        # Use maxlen to prevent unbounded memory growth (memory leak fix)
+        # Allow 2x the limit to handle burst cleanup scenarios
+        self.request_times: deque = deque(maxlen=requests_per_minute * 2)
         self._lock = asyncio.Lock()
+    
+    def cleanup(self) -> int:
+        """
+        Explicitly clean up expired request timestamps.
+        Returns the number of entries removed.
+        
+        Call this periodically to prevent memory buildup during idle periods.
+        """
+        now = time.time()
+        removed = 0
+        while self.request_times and now - self.request_times[0] > self.window_seconds:
+            self.request_times.popleft()
+            removed += 1
+        return removed
 
     async def acquire(self) -> float:
         """
@@ -77,6 +97,15 @@ class RateLimiter:
             await asyncio.sleep(wait_time)
             # Try again after waiting
             await self.wait_and_acquire()
+    
+    def reset(self) -> None:
+        """
+        Reset the rate limiter state.
+        
+        Clears all tracked requests. Use this during testing or
+        after long idle periods to reclaim memory.
+        """
+        self.request_times.clear()
 
     def get_status(self) -> dict:
         """
