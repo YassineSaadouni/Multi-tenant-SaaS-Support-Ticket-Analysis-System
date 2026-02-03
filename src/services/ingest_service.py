@@ -26,9 +26,11 @@ class IngestService:
         """
         Fetch tickets from the external API and persist them for a tenant.
         Handles pagination, ensures idempotency, classifies tickets, and triggers notifications.
+        Logs every run to ingestion_logs collection with full traceability.
         """
         db = await get_db()
         job_id = str(uuid.uuid4())
+        started_at = datetime.utcnow()
 
         # ============================================================
         # 🐛 DEBUG TASK D: Race condition - FIXED
@@ -38,7 +40,7 @@ class IngestService:
             "tenant_id": tenant_id,
             "job_id": job_id,
             "status": "running",
-            "started_at": datetime.utcnow(),
+            "started_at": started_at,
             "progress": 0,
             "total_pages": None,
             "processed_pages": 0,
@@ -68,11 +70,16 @@ class IngestService:
             logger.error(f"Failed to create job: {e}")
             raise
 
+        # Metrics tracking
         new_ingested = 0
         updated = 0
         errors = 0
+        high_priority_count = 0
+        total_retry_attempts = 0
         page = 1
         total_pages = None
+        final_status = "success"
+        error_message = None
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -83,12 +90,14 @@ class IngestService:
                     )
                     if job_status and job_status.get("cancelled"):
                         logger.info(f"Job {job_id} cancelled by user")
+                        final_status = "cancelled"
                         break
 
                     # Fetch page with manual retry logic (no external retry library)
-                    tickets_data = await self._fetch_page_with_retry(
+                    tickets_data, retry_count = await self._fetch_page_with_retry(
                         client, tenant_id, page
                     )
+                    total_retry_attempts += retry_count
                     
                     if not tickets_data:
                         break
@@ -114,6 +123,10 @@ class IngestService:
                                 ticket_data["message"],
                                 ticket_data["subject"]
                             )
+                            
+                            # Track high priority tickets
+                            if classification["urgency"] == "high":
+                                high_priority_count += 1
                             
                             # Prepare ticket document
                             ticket_doc = {
@@ -188,54 +201,81 @@ class IngestService:
                     
         except Exception as e:
             logger.error(f"Ingestion failed for tenant {tenant_id}: {e}")
+            final_status = "failure"
+            error_message = str(e)
+            
             # Update job status to failed
             await db.ingestion_jobs.update_one(
                 {"_id": job_doc["_id"]},
-                {"$set": {"status": "failed", "ended_at": datetime.utcnow(), "error": str(e)}}
+                {"$set": {"status": "failed", "ended_at": datetime.utcnow(), "error": error_message}}
             )
             
-            # Log failure
-            await db.ingestion_logs.insert_one({
+        finally:
+            # ============================================================
+            # TASK 6: Persistent logging with try-finally for guaranteed execution
+            # This block always executes, even on fatal errors
+            # ============================================================
+            ended_at = datetime.utcnow()
+            duration_seconds = (ended_at - started_at).total_seconds()
+            
+            # Determine final status if not already set
+            if final_status == "success":
+                # Check if there were any errors during processing
+                if errors > 0 and (new_ingested > 0 or updated > 0):
+                    final_status = "partial_success"
+                elif errors > 0:
+                    final_status = "failure"
+            
+            # Calculate total tickets processed
+            total_tickets = new_ingested + updated
+            
+            # Create comprehensive log entry
+            log_entry = {
                 "tenant_id": tenant_id,
                 "job_id": job_id,
-                "status": "failed",
-                "error": str(e),
-                "started_at": job_doc["started_at"],
-                "ended_at": datetime.utcnow(),
-                "new_ingested": new_ingested,
-                "updated": updated,
-                "errors": errors
-            })
-            raise
-
-        # Determine final status
-        job_status = await db.ingestion_jobs.find_one({"_id": job_doc["_id"]})
-        final_status = "cancelled" if job_status and job_status.get("cancelled") else "completed"
-        
-        # Update job status to completed
-        await db.ingestion_jobs.update_one(
-            {"_id": job_doc["_id"]},
-            {"$set": {"status": final_status, "ended_at": datetime.utcnow()}}
-        )
-
-        # Log successful completion
-        await db.ingestion_logs.insert_one({
-            "tenant_id": tenant_id,
-            "job_id": job_id,
-            "status": final_status,
-            "started_at": job_doc["started_at"],
-            "ended_at": datetime.utcnow(),
-            "new_ingested": new_ingested,
-            "updated": updated,
-            "errors": errors
-        })
+                "status": final_status,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "duration_seconds": duration_seconds,
+                "metrics": {
+                    "total_tickets": total_tickets,
+                    "new_ingested": new_ingested,
+                    "updated": updated,
+                    "errors": errors,
+                    "high_priority_count": high_priority_count,
+                    "retry_attempts": total_retry_attempts,
+                    "pages_processed": page - 1 if page > 1 else 0,
+                    "total_pages": total_pages
+                },
+                "error": error_message
+            }
+            
+            try:
+                await db.ingestion_logs.insert_one(log_entry)
+                logger.info(f"Logged ingestion run: job_id={job_id}, status={final_status}, tickets={total_tickets}")
+            except Exception as log_error:
+                # Even if logging fails, don't fail the entire ingestion
+                logger.error(f"Failed to write ingestion log: {log_error}")
+            
+            # Update job status to final state if not already failed
+            if final_status != "failure":
+                await db.ingestion_jobs.update_one(
+                    {"_id": job_doc["_id"]},
+                    {"$set": {"status": final_status, "ended_at": ended_at}}
+                )
+            
+            # Re-raise exception if this was a failure
+            if final_status == "failure" and error_message:
+                raise Exception(error_message)
 
         return {
             "status": final_status,
             "job_id": job_id,
             "new_ingested": new_ingested,
             "updated": updated,
-            "errors": errors
+            "errors": errors,
+            "high_priority_count": high_priority_count,
+            "retry_attempts": total_retry_attempts
         }
     
     async def _fetch_page_with_retry(
@@ -244,27 +284,32 @@ class IngestService:
         tenant_id: str, 
         page: int,
         max_retries: int = 5
-    ) -> Optional[dict]:
+    ) -> tuple[Optional[dict], int]:
         """
         Fetch a single page with manual retry logic.
         Handles 429 rate limiting with Retry-After header.
         No external retry libraries used - manual implementation with asyncio.
+        
+        Returns:
+            tuple: (response_data, retry_count) where retry_count is the number of retry attempts
         """
         url = f"{settings.EXTERNAL_API_URL}/external/support-tickets"
         params = {"page": page, "page_size": 50}
+        retry_count = 0
         
         for attempt in range(max_retries):
             try:
                 response = await client.get(url, params=params)
                 
                 if response.status_code == 200:
-                    return response.json()
+                    return response.json(), retry_count
                 
                 elif response.status_code == 429:
                     # Rate limited - respect Retry-After header
                     retry_after = int(response.headers.get("Retry-After", 5))
                     logger.warning(f"Rate limited. Waiting {retry_after}s before retry...")
                     await asyncio.sleep(retry_after)
+                    retry_count += 1
                     continue
                 
                 elif response.status_code >= 500:
@@ -272,24 +317,26 @@ class IngestService:
                     wait_time = min(2 ** attempt, 30)  # Cap at 30 seconds
                     logger.warning(f"Server error {response.status_code}. Retrying in {wait_time}s...")
                     await asyncio.sleep(wait_time)
+                    retry_count += 1
                     continue
                 
                 else:
                     # Other error - log and return None
                     logger.error(f"Unexpected status {response.status_code}: {response.text}")
-                    return None
+                    return None, retry_count
                     
             except httpx.RequestError as e:
                 # Network error - exponential backoff
                 wait_time = min(2 ** attempt, 30)
                 logger.warning(f"Request error: {e}. Retrying in {wait_time}s...")
                 await asyncio.sleep(wait_time)
+                retry_count += 1
                 
                 if attempt == max_retries - 1:
                     logger.error(f"Failed to fetch page {page} after {max_retries} attempts")
-                    return None
+                    return None, retry_count
         
-        return None
+        return None, retry_count
 
     async def get_job_status(self, job_id: str) -> Optional[dict]:
         """Retrieve the status of a specific ingestion job."""

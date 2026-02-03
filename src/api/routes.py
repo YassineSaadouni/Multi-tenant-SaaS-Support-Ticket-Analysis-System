@@ -252,6 +252,43 @@ async def get_ingestion_progress(
     return status
 
 
+@router.get("/ingest/logs/{tenant_id}")
+async def get_ingestion_logs(
+    tenant_id: str,
+    limit: int = Query(10, ge=1, le=100),
+    status: Optional[str] = Query(None, pattern="^(success|partial_success|failure|cancelled)$")
+):
+    """
+    Retrieve ingestion logs for a specific tenant (Task 6).
+    
+    Returns a history of ingestion runs with full traceability including:
+    - Start/end timestamps
+    - Status (success, partial_success, failure, cancelled)
+    - Processing metrics (total tickets, high-priority count, retry attempts)
+    - Error context (if applicable)
+    """
+    db = await get_db()
+    
+    query = {"tenant_id": tenant_id}
+    if status:
+        query["status"] = status
+    
+    cursor = db.ingestion_logs.find(query).sort("started_at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    
+    # Convert ObjectId to string for JSON serialization
+    for log in logs:
+        log["_id"] = str(log["_id"])
+        log["started_at"] = log["started_at"].isoformat()
+        log["ended_at"] = log["ended_at"].isoformat()
+    
+    return {
+        "tenant_id": tenant_id,
+        "logs": logs,
+        "count": len(logs)
+    }
+
+
 @router.delete("/ingest/{job_id}")
 async def cancel_ingestion(
     job_id: str,

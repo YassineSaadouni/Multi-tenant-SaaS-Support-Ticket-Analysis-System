@@ -48,10 +48,39 @@ async def create_indexes():
     await ingestion_jobs.create_index([("tenant_id", pymongo.ASCENDING)])
     await ingestion_jobs.create_index([("status", pymongo.ASCENDING)])
 
-    # ingestion_logs 컬렉션 인덱스
+    # ingestion_logs 컬렉션 인덱스 (Task 6: Persistent Logging)
+    # Optimized for common query patterns:
+    # 1. Recent logs for a tenant (tenant_id + started_at DESC)
+    # 2. Failed runs for a tenant (tenant_id + status + started_at DESC)
+    # 3. Lookup by job_id for traceability
     ingestion_logs = db.ingestion_logs
-    await ingestion_logs.create_index([("tenant_id", pymongo.ASCENDING)])
-    await ingestion_logs.create_index([("job_id", pymongo.ASCENDING)])
+    await ingestion_logs.create_index([
+        ("tenant_id", pymongo.ASCENDING),
+        ("started_at", pymongo.DESCENDING)
+    ])
+    await ingestion_logs.create_index([
+        ("tenant_id", pymongo.ASCENDING),
+        ("status", pymongo.ASCENDING),
+        ("started_at", pymongo.DESCENDING)
+    ])
+    # Unique index on job_id with explicit name to avoid conflicts
+    try:
+        await ingestion_logs.create_index(
+            [("job_id", pymongo.ASCENDING)],
+            unique=True,
+            name="job_id_unique_idx"
+        )
+    except Exception:
+        # Index might already exist or conflict - drop and recreate
+        try:
+            await ingestion_logs.drop_index("job_id_1")
+        except Exception:
+            pass
+        await ingestion_logs.create_index(
+            [("job_id", pymongo.ASCENDING)],
+            unique=True,
+            name="job_id_unique_idx"
+        )
 
 
 # ============================================================
