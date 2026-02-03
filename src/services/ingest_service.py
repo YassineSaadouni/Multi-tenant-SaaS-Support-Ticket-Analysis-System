@@ -6,6 +6,7 @@ import uuid
 from src.db.mongo import get_db
 from src.services.classify_service import ClassifyService
 from src.services.notify_service import NotifyService
+from src.services.rate_limiter import get_rate_limiter
 from src.core.config import settings
 from src.core.logging import logger
 from bson import ObjectId
@@ -21,6 +22,7 @@ class IngestService:
         self.external_api_url = f"{settings.EXTERNAL_API_URL}/external/support-tickets"
         self.classify_service = ClassifyService()
         self.notify_service = NotifyService()
+        self.rate_limiter = get_rate_limiter()  # Global rate limiter
 
     async def run_ingestion(self, tenant_id: str, job_id: str = None) -> dict:
         """
@@ -308,6 +310,9 @@ class IngestService:
         
         for attempt in range(max_retries):
             try:
+                # Wait for rate limiter permission before making request
+                await self.rate_limiter.wait_and_acquire()
+                
                 response = await client.get(url, params=params)
                 
                 if response.status_code == 200:

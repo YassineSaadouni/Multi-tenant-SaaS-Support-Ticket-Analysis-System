@@ -45,8 +45,23 @@ class RateLimiter:
         - If the limit is exceeded, compute how long to wait.
         - Ensure thread-safety using `asyncio.Lock`.
         """
-        # TODO: implement
-        return 0
+        async with self._lock:
+            now = time.time()
+            
+            # Remove requests outside the current window
+            while self.request_times and now - self.request_times[0] > self.window_seconds:
+                self.request_times.popleft()
+            
+            # Check if we're at the limit
+            if len(self.request_times) >= self.requests_per_minute:
+                # Need to wait until the oldest request expires
+                oldest = self.request_times[0]
+                wait_time = self.window_seconds - (now - oldest)
+                return max(0, wait_time)
+            
+            # Record this request
+            self.request_times.append(now)
+            return 0
 
     async def wait_and_acquire(self) -> None:
         """
@@ -57,8 +72,11 @@ class RateLimiter:
 
         TODO: Implement this using `acquire()` and `asyncio.sleep()`.
         """
-        # TODO: implement
-        pass
+        wait_time = await self.acquire()
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+            # Try again after waiting
+            await self.wait_and_acquire()
 
     def get_status(self) -> dict:
         """
@@ -113,8 +131,22 @@ class TokenBucketRateLimiter:
         - If at least one token is available, consume it and return 0.
         - If no tokens are available, compute how long until the next token.
         """
-        # TODO: implement
-        return 0
+        async with self._lock:
+            now = time.time()
+            elapsed = now - self.last_update
+            
+            # Refill tokens based on elapsed time
+            self.tokens = min(self.bucket_size, self.tokens + elapsed * self.tokens_per_second)
+            self.last_update = now
+            
+            # Check if we have tokens available
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return 0
+            
+            # Calculate wait time for next token
+            wait_time = (1.0 - self.tokens) / self.tokens_per_second
+            return wait_time
 
     async def wait_and_acquire(self) -> None:
         """
@@ -122,8 +154,11 @@ class TokenBucketRateLimiter:
 
         TODO: Implement this using `acquire()` and `asyncio.sleep()`.
         """
-        # TODO: implement
-        pass
+        wait_time = await self.acquire()
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+            # Recursively try again
+            await self.wait_and_acquire()
 
 
 # Global RateLimiter singleton instance.

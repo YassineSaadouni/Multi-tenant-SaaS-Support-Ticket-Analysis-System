@@ -187,7 +187,8 @@ async def health_check():
         "analytics": "/tenants/{tenant_id}/stats",
         "tickets": "/tickets",
         "health": "/health",
-        "circuit_status": "/circuit/{name}/status"
+        "circuit_status": "/circuit/{name}/status",
+        "rate_limit_status": "/rate-limit/status"
     }
     
     # Set final status
@@ -200,6 +201,18 @@ async def health_check():
         )
     
     return health_status
+
+
+@router.get("/rate-limit/status")
+async def get_rate_limit_status():
+    """
+    Get current rate limiter status.
+    Shows how many API calls are remaining in the current window.
+    """
+    from src.services.rate_limiter import get_rate_limiter
+    
+    limiter = get_rate_limiter()
+    return limiter.get_status()
 
 
 # ============================================================
