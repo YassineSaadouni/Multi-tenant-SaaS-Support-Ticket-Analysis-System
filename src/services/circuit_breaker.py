@@ -96,37 +96,65 @@ class CircuitBreaker:
 
         Raises:
             CircuitBreakerOpenError: When the circuit is OPEN.
-
-        TODO: Implement:
-        - CLOSED: allow calls, record failures/successes.
-        - OPEN: immediately raise CircuitBreakerOpenError.
-        - HALF_OPEN: allow limited calls and transition based on result.
         """
-        # TODO: implement
-        pass
+        current_state = self.state  # Check state and apply transitions
+        
+        # OPEN state: fail fast
+        if current_state == CircuitState.OPEN:
+            retry_after = self.config.timeout_seconds - (time.time() - self._opened_at) if self._opened_at else 0
+            raise CircuitBreakerOpenError(retry_after=max(0, retry_after))
+        
+        # HALF_OPEN state: limit concurrent calls
+        if current_state == CircuitState.HALF_OPEN:
+            async with self._lock:
+                if self._half_open_calls >= self.config.half_open_max_calls:
+                    raise CircuitBreakerOpenError(retry_after=1.0)
+                self._half_open_calls += 1
+        
+        # Execute the function
+        try:
+            result = await func(*args, **kwargs)
+            await self._on_success()
+            return result
+        except Exception as e:
+            await self._on_failure()
+            raise
+        finally:
+            if current_state == CircuitState.HALF_OPEN:
+                async with self._lock:
+                    self._half_open_calls = max(0, self._half_open_calls - 1)
 
     async def _on_success(self) -> None:
         """
         Handler invoked on successful calls.
-
-        TODO: Implement:
-        - In HALF_OPEN, transition to CLOSED on success.
-        - Record the success in the recent results window.
         """
-        # TODO: implement
-        pass
+        async with self._lock:
+            self._success_count += 1
+            self._recent_results.append(True)
+            
+            # HALF_OPEN → CLOSED on success
+            if self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.CLOSED
+                self._failure_count = 0
+                self._opened_at = None
 
     async def _on_failure(self) -> None:
         """
         Handler invoked on failed calls.
-
-        TODO: Implement:
-        - Record the failure in the recent results window.
-        - Decide whether to transition to OPEN based on failure rate.
-        - In HALF_OPEN, transition to OPEN immediately on failure.
         """
-        # TODO: implement
-        pass
+        async with self._lock:
+            self._failure_count += 1
+            self._recent_results.append(False)
+            self._last_failure_time = time.time()
+            
+            # HALF_OPEN → OPEN immediately on failure
+            if self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.OPEN
+                self._opened_at = time.time()
+            # CLOSED → OPEN if threshold exceeded
+            elif self._state == CircuitState.CLOSED and self._should_open():
+                self._state = CircuitState.OPEN
+                self._opened_at = time.time()
 
     def _should_open(self) -> bool:
         """
@@ -134,13 +162,13 @@ class CircuitBreaker:
 
         Returns:
             True if the circuit should transition to OPEN.
-
-        TODO: Implement:
-        - Return True if at least `failure_threshold` failures occurred
-          within the last `window_size` calls.
         """
-        # TODO: implement
-        return False
+        if len(self._recent_results) < self.config.window_size:
+            return False
+        
+        # Count failures in the window
+        failures = sum(1 for r in self._recent_results if not r)
+        return failures >= self.config.failure_threshold
 
     def get_status(self) -> dict:
         """
