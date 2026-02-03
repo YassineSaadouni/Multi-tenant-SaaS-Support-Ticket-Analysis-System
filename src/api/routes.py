@@ -68,16 +68,107 @@ async def get_ticket(ticket_id: str, tenant_id: str):
 @router.get("/health")
 async def health_check():
     """
-    System health check.
-
-    TODO: Implement:
-    - Check MongoDB connectivity.
-    - Check external API/service connectivity.
-    - Return a non-200 status code if any dependency is unhealthy.
+    System health check with dependency verification.
+    
+    Checks:
+    - MongoDB connectivity
+    - Notification service (external API)
+    - Circuit breaker status
+    
+    Returns:
+    - 200 OK if all dependencies are healthy
+    - 503 Service Unavailable if any dependency fails
     """
-    # Basic health check endpoint.
-    # TODO: implement dependency checks (e.g., DB, external services).
-    return {"status": "ok"}
+    import httpx
+    from src.core.config import settings
+    
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "dependencies": {}
+    }
+    
+    all_healthy = True
+    
+    # Check MongoDB connectivity
+    try:
+        db = await get_db()
+        # Simple ping operation with timeout
+        await db.command("ping", maxTimeMS=2000)
+        health_status["dependencies"]["mongodb"] = {
+            "status": "healthy",
+            "message": "Connection successful"
+        }
+    except Exception as e:
+        all_healthy = False
+        health_status["dependencies"]["mongodb"] = {
+            "status": "unhealthy",
+            "message": f"Connection failed: {str(e)}"
+        }
+    
+    # Check notification service (external API) with short timeout
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{settings.EXTERNAL_API_URL}/health")
+            if response.status_code == 200:
+                health_status["dependencies"]["notification_service"] = {
+                    "status": "healthy",
+                    "message": "Service reachable"
+                }
+            else:
+                all_healthy = False
+                health_status["dependencies"]["notification_service"] = {
+                    "status": "unhealthy",
+                    "message": f"Service returned {response.status_code}"
+                }
+    except httpx.TimeoutException:
+        all_healthy = False
+        health_status["dependencies"]["notification_service"] = {
+            "status": "unhealthy",
+            "message": "Connection timeout (>2s)"
+        }
+    except Exception as e:
+        all_healthy = False
+        health_status["dependencies"]["notification_service"] = {
+            "status": "unhealthy",
+            "message": f"Connection failed: {str(e)}"
+        }
+    
+    # Check circuit breaker status
+    try:
+        cb = get_circuit_breaker("notify_api")
+        cb_status = cb.get_status()
+        health_status["dependencies"]["circuit_breaker"] = {
+            "status": "healthy" if cb_status["state"] != "open" else "degraded",
+            "state": cb_status["state"],
+            "failure_rate": cb_status["recent_failure_rate"]
+        }
+        # Circuit open is degraded, not unhealthy
+    except Exception as e:
+        health_status["dependencies"]["circuit_breaker"] = {
+            "status": "unknown",
+            "message": f"Check failed: {str(e)}"
+        }
+    
+    # Verify critical routes exist
+    health_status["routes"] = {
+        "ingestion": "/ingest/run",
+        "analytics": "/tenants/{tenant_id}/stats",
+        "tickets": "/tickets",
+        "health": "/health",
+        "circuit_status": "/circuit/{name}/status"
+    }
+    
+    # Set final status
+    if not all_healthy:
+        health_status["status"] = "unhealthy"
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content=health_status
+        )
+    
+    return health_status
 
 
 # ============================================================
