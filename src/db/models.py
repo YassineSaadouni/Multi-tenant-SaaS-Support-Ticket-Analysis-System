@@ -17,6 +17,8 @@ class TicketInDB(TicketBase):
     urgency: str
     sentiment: str
     requires_action: bool
+    updated_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
 
 class TicketResponse(TicketInDB):
     pass
