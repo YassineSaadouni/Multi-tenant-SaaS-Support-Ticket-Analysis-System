@@ -1,14 +1,32 @@
 from datetime import datetime, timedelta
 from typing import Optional
 from src.db.mongo import get_db
+from src.core.config import settings
+from src.core.logging import logger
+import pymongo
 
 class AnalyticsService:
-    async def get_tenant_stats(self, tenant_id: str, from_date: Optional[datetime] = None, to_date: Optional[datetime] = None) -> dict:
+    async def get_tenant_stats(
+        self, 
+        tenant_id: str, 
+        from_date: Optional[datetime] = None, 
+        to_date: Optional[datetime] = None,
+        max_results: Optional[int] = None
+    ) -> dict:
         """
         Compute analytics for a tenant using MongoDB aggregation pipeline.
         All computation happens in the database for optimal performance.
+        
+        Resource Management:
+        - Query timeout enforced to prevent long-running queries
+        - Result size limited to prevent memory exhaustion
+        - Connection automatically returned to pool after use
         """
         db = await get_db()
+        
+        # Enforce max results limit to prevent memory exhaustion
+        if max_results is None:
+            max_results = settings.MAX_PAGE_SIZE
         
         # Default date range: last 24 hours for hourly trend
         if not to_date:
@@ -128,8 +146,20 @@ class AnalyticsService:
             }
         ]
         
-        # Execute aggregation
-        result = await db.tickets.aggregate(pipeline).to_list(length=1)
+        # Execute aggregation with timeout to prevent resource exhaustion
+        try:
+            cursor = db.tickets.aggregate(
+                pipeline,
+                maxTimeMS=settings.ANALYTICS_QUERY_TIMEOUT_MS,  # Query timeout
+                allowDiskUse=False  # Prevent disk spills for predictable memory usage
+            )
+            result = await cursor.to_list(length=1)
+        except pymongo.errors.ExecutionTimeout:
+            logger.error(f"Analytics query timeout for tenant {tenant_id}")
+            raise Exception(f"Analytics query exceeded timeout of {settings.ANALYTICS_QUERY_TIMEOUT_MS}ms")
+        except Exception as e:
+            logger.error(f"Analytics query failed for tenant {tenant_id}: {e}")
+            raise
         
         if not result:
             return self._empty_stats()

@@ -82,7 +82,15 @@ class IngestService:
         error_message = None
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            # Create HTTP client with proper connection pool limits and timeouts
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                limits=httpx.Limits(
+                    max_connections=20,  # Max concurrent connections
+                    max_keepalive_connections=10,  # Keep-alive pool size
+                    keepalive_expiry=30.0  # Connection reuse timeout
+                )
+            ) as client:
                 while True:
                     # Check if job was cancelled
                     job_status = await db.ingestion_jobs.find_one(

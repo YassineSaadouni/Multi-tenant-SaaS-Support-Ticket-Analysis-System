@@ -2,11 +2,12 @@ from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from typing import List, Optional
 from datetime import datetime
 from src.db.models import TicketResponse, TenantStats
-from src.db.mongo import get_db
+from src.db.mongo import get_db, ping_db
 from src.services.ingest_service import IngestService
 from src.services.analytics_service import AnalyticsService
 from src.services.lock_service import LockService
 from src.services.circuit_breaker import get_circuit_breaker
+from src.core.config import settings
 
 router = APIRouter()
 
@@ -22,9 +23,22 @@ async def list_tickets(
     urgency: Optional[str] = None,
     source: Optional[str] = None,
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100)
+    page_size: int = Query(20, ge=1, le=1000)
 ):
+    """
+    List tickets with resource-aware pagination.
+    
+    Resource Management:
+    - Page size capped at MAX_PAGE_SIZE to prevent memory exhaustion
+    - Query timeout enforced
+    - Connection automatically returned to pool
+    """
     db = await get_db()
+    
+    # Enforce max page size limit
+    if page_size > settings.MAX_PAGE_SIZE:
+        page_size = settings.MAX_PAGE_SIZE
+    
     query: dict = {}
 
     # ============================================================
@@ -44,9 +58,19 @@ async def list_tickets(
     # 🐛 TODO: Add tenant_id scoping to the query.
     # 🐛 TODO: Filter out tickets with a non-null deleted_at (soft delete).
 
-    cursor = db.tickets.find(query).skip((page - 1) * page_size).limit(page_size)
-    docs = await cursor.to_list(length=page_size)
-    return docs
+    # Execute query with timeout to prevent resource exhaustion
+    try:
+        cursor = db.tickets.find(
+            query,
+            max_time_ms=settings.DEFAULT_QUERY_TIMEOUT_MS
+        ).skip((page - 1) * page_size).limit(page_size)
+        docs = await cursor.to_list(length=page_size)
+        return docs
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed or timed out: {str(e)}"
+        )
 
 
 @router.get("/tickets/urgent", response_model=List[TicketResponse])
@@ -71,7 +95,7 @@ async def health_check():
     System health check with dependency verification.
     
     Checks:
-    - MongoDB connectivity
+    - MongoDB connectivity (using connection pool)
     - Notification service (external API)
     - Circuit breaker status
     
@@ -80,7 +104,6 @@ async def health_check():
     - 503 Service Unavailable if any dependency fails
     """
     import httpx
-    from src.core.config import settings
     
     health_status = {
         "status": "healthy",
@@ -90,15 +113,20 @@ async def health_check():
     
     all_healthy = True
     
-    # Check MongoDB connectivity
+    # Check MongoDB connectivity using connection pool
     try:
-        db = await get_db()
-        # Simple ping operation with timeout
-        await db.command("ping", maxTimeMS=2000)
-        health_status["dependencies"]["mongodb"] = {
-            "status": "healthy",
-            "message": "Connection successful"
-        }
+        is_healthy = await ping_db()
+        if is_healthy:
+            health_status["dependencies"]["mongodb"] = {
+                "status": "healthy",
+                "message": "Connection pool healthy"
+            }
+        else:
+            all_healthy = False
+            health_status["dependencies"]["mongodb"] = {
+                "status": "unhealthy",
+                "message": "Connection failed"
+            }
     except Exception as e:
         all_healthy = False
         health_status["dependencies"]["mongodb"] = {
@@ -106,9 +134,12 @@ async def health_check():
             "message": f"Connection failed: {str(e)}"
         }
     
-    # Check notification service (external API) with short timeout
+    # Check notification service (external API) with proper timeout and resource cleanup
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(2.0, connect=1.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        ) as client:
             response = await client.get(f"{settings.EXTERNAL_API_URL}/health")
             if response.status_code == 200:
                 health_status["dependencies"]["notification_service"] = {

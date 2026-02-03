@@ -138,7 +138,19 @@ class NotifyService:
         """
         Make the actual HTTP request to the notification endpoint.
         This method is wrapped by the circuit breaker.
+        
+        Resource Management:
+        - Connection pool limits prevent resource exhaustion
+        - Timeout enforced to prevent hanging requests
+        - Connections automatically cleaned up via context manager
         """
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+                keepalive_expiry=30.0
+            )
+        ) as client:
             response = await client.post(self.notify_url, json=payload)
             response.raise_for_status()
