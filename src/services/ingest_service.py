@@ -22,14 +22,15 @@ class IngestService:
         self.classify_service = ClassifyService()
         self.notify_service = NotifyService()
 
-    async def run_ingestion(self, tenant_id: str) -> dict:
+    async def run_ingestion(self, tenant_id: str, job_id: str = None) -> dict:
         """
         Fetch tickets from the external API and persist them for a tenant.
         Handles pagination, ensures idempotency, classifies tickets, and triggers notifications.
         Logs every run to ingestion_logs collection with full traceability.
         """
         db = await get_db()
-        job_id = str(uuid.uuid4())
+        if job_id is None:
+            job_id = str(uuid.uuid4())
         started_at = datetime.utcnow()
 
         # ============================================================

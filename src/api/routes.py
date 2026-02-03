@@ -227,6 +227,68 @@ async def get_tenant_stats(
 # Ingestion APIs (Task 1, 8, 9)
 # ============================================================
 
+@router.get("/ingest/progress/{job_id}")
+async def get_ingestion_progress(job_id: str):
+    """
+    Get real-time progress of a running ingestion job.
+    
+    Returns:
+        Job status with progress metrics
+    """
+    db = await get_db()
+    job = await db.ingestion_jobs.find_one({"job_id": job_id})
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Calculate progress percentage
+    total = job.get("total_pages", 0)
+    processed = job.get("processed_pages", 0)
+    progress = int((processed / total) * 100) if total > 0 else 0
+    
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "progress": progress,
+        "total_pages": total,
+        "processed_pages": processed,
+        "tenant_id": job["tenant_id"],
+        "started_at": job["started_at"].isoformat() if job.get("started_at") else None
+    }
+
+
+@router.delete("/ingest/{job_id}")
+async def cancel_ingestion(job_id: str):
+    """
+    Cancel a running ingestion job gracefully.
+    Preserves already-ingested data.
+    """
+    db = await get_db()
+    job = await db.ingestion_jobs.find_one({"job_id": job_id})
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if job["status"] != "running":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is not running (status: {job['status']})"
+        )
+    
+    # Set cancellation flag
+    await db.ingestion_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"cancelled": True}}
+    )
+    
+    return {
+        "message": "Cancellation requested",
+        "job_id": job_id,
+        "processed_pages": job.get("processed_pages", 0),
+        "total_pages": job.get("total_pages", 0)
+    }
+
+
 @router.post("/ingest/run")
 async def run_ingestion(
     tenant_id: str,
@@ -273,8 +335,15 @@ async def run_ingestion(
     
     # Lock acquired - run ingestion and ensure lock is released
     try:
-        result = await ingest_service.run_ingestion(tenant_id)
-        return {"status": "ingestion_started", "result": result}
+        # Run ingestion in background
+        background_tasks.add_task(ingest_service.run_ingestion, tenant_id, job_id)
+        
+        return {
+            "status": "ingestion_started",
+            "tenant_id": tenant_id,
+            "job_id": job_id,
+            "progress_url": f"/ingest/progress/{job_id}"
+        }
     finally:
         # Always release the lock, even if ingestion fails
         await lock_service.release_lock(resource_id, job_id)
