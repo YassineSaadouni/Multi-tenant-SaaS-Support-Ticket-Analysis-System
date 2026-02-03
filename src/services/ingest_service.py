@@ -139,6 +139,21 @@ class IngestService:
                             if classification["urgency"] == "high":
                                 high_priority_count += 1
                             
+                            # Parse updated_at from external API
+                            external_updated_at = datetime.fromisoformat(
+                                ticket_data.get("updated_at", ticket_data["created_at"]).replace("Z", "+00:00")
+                            )
+                            
+                            # Check if ticket exists and needs update
+                            existing_ticket = await db.tickets.find_one({
+                                "tenant_id": ticket_data["tenant_id"],
+                                "external_id": ticket_data["id"]
+                            })
+                            
+                            # Skip if ticket hasn't changed (incremental sync)
+                            if existing_ticket and existing_ticket.get("updated_at") == external_updated_at:
+                                continue
+                            
                             # Prepare ticket document
                             ticket_doc = {
                                 "external_id": ticket_data["id"],
@@ -154,11 +169,15 @@ class IngestService:
                                 "urgency": classification["urgency"],
                                 "sentiment": classification["sentiment"],
                                 "requires_action": classification["requires_action"],
-                                "updated_at": datetime.fromisoformat(
-                                    ticket_data.get("updated_at", ticket_data["created_at"]).replace("Z", "+00:00")
-                                ),
+                                "updated_at": external_updated_at,
                                 "ingested_at": datetime.utcnow()
                             }
+                            
+                            # Track field-level changes if updating existing ticket
+                            if existing_ticket:
+                                await self._record_ticket_changes(
+                                    db, existing_ticket, ticket_doc, tenant_id
+                                )
                             
                             # Upsert for idempotency (tenant_id + external_id is unique)
                             upsert_result = await db.tickets.update_one(
@@ -382,6 +401,127 @@ class IngestService:
             {"$set": {"status": "cancelled", "ended_at": datetime.utcnow()}}
         )
         return result.modified_count > 0
+
+    async def _record_ticket_changes(
+        self, 
+        db, 
+        old_ticket: dict, 
+        new_ticket: dict, 
+        tenant_id: str
+    ) -> None:
+        """
+        Record field-level changes in ticket_history collection.
+        Tracks what changed, when, and the before/after values.
+        """
+        changes = []
+        
+        # Fields to track for changes
+        tracked_fields = [
+            "status", "subject", "message", "urgency", 
+            "sentiment", "requires_action", "customer_id", "source"
+        ]
+        
+        for field in tracked_fields:
+            old_value = old_ticket.get(field)
+            new_value = new_ticket.get(field)
+            
+            if old_value != new_value:
+                changes.append({
+                    "field": field,
+                    "old_value": old_value,
+                    "new_value": new_value
+                })
+        
+        # Only insert history entry if there are actual changes
+        if changes:
+            history_entry = {
+                "ticket_id": old_ticket["_id"],
+                "external_id": old_ticket["external_id"],
+                "tenant_id": tenant_id,
+                "changes": changes,
+                "changed_at": datetime.utcnow(),
+                "sync_timestamp": new_ticket.get("updated_at")
+            }
+            
+            await db.ticket_history.insert_one(history_entry)
+            logger.info(
+                f"Recorded {len(changes)} field changes for ticket "
+                f"{old_ticket['external_id']}"
+            )
+    
+    async def detect_deleted_tickets(self, tenant_id: str) -> int:
+        """
+        Detect tickets that were deleted externally and apply soft delete.
+        Compares local tickets against external API to find deletions.
+        
+        Returns:
+            Number of tickets soft-deleted
+        """
+        db = await get_db()
+        
+        # Get all external IDs from API
+        external_ids = set()
+        page = 1
+        
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        ) as client:
+            while True:
+                tickets_data, _ = await self._fetch_page_with_retry(client, tenant_id, page)
+                if not tickets_data:
+                    break
+                
+                tickets = tickets_data.get("tickets", [])
+                if not tickets:
+                    break
+                
+                for ticket in tickets:
+                    external_ids.add(ticket["id"])
+                
+                if not tickets_data.get("next_page"):
+                    break
+                
+                page += 1
+        
+        # Find tickets in DB that aren't in external API (deleted externally)
+        local_tickets = await db.tickets.find({
+            "tenant_id": tenant_id,
+            "deleted_at": {"$exists": False}  # Only check non-deleted tickets
+        }).to_list(length=None)
+        
+        deleted_count = 0
+        for ticket in local_tickets:
+            if ticket["external_id"] not in external_ids:
+                # Soft delete: set deleted_at timestamp
+                await db.tickets.update_one(
+                    {"_id": ticket["_id"]},
+                    {
+                        "$set": {
+                            "deleted_at": datetime.utcnow(),
+                            "deletion_detected_at": datetime.utcnow()
+                        }
+                    }
+                )
+                
+                # Record deletion in history
+                await db.ticket_history.insert_one({
+                    "ticket_id": ticket["_id"],
+                    "external_id": ticket["external_id"],
+                    "tenant_id": tenant_id,
+                    "changes": [{
+                        "field": "deleted",
+                        "old_value": False,
+                        "new_value": True
+                    }],
+                    "changed_at": datetime.utcnow(),
+                    "sync_timestamp": datetime.utcnow()
+                })
+                
+                deleted_count += 1
+                logger.info(f"Soft-deleted ticket {ticket['external_id']} (not found in external API)")
+        
+        return deleted_count
 
     async def get_ingestion_status(self, tenant_id: str) -> Optional[dict]:
         """Get the current ingestion status for a given tenant."""

@@ -42,6 +42,18 @@ async def create_indexes():
         ("tenant_id", pymongo.ASCENDING),
         ("external_id", pymongo.ASCENDING)
     ], unique=True)
+    
+    # Index for soft delete queries - exclude deleted tickets from normal queries
+    await tickets.create_index([
+        ("tenant_id", pymongo.ASCENDING),
+        ("deleted_at", pymongo.ASCENDING)
+    ])
+    
+    # Index for updated_at to support incremental sync
+    await tickets.create_index([
+        ("tenant_id", pymongo.ASCENDING),
+        ("updated_at", pymongo.DESCENDING)
+    ])
 
     # ingestion_jobs 컬렉션 인덱스
     ingestion_jobs = db.ingestion_jobs
@@ -106,6 +118,29 @@ async def create_indexes():
         [("owner_id", pymongo.ASCENDING)],
         name="owner_id_idx"
     )
+    
+    # ticket_history collection indexes (Task 12: Change History)
+    # Optimized for audit queries and ticket history retrieval
+    ticket_history = db.ticket_history
+    
+    # Primary query pattern: get history for a specific ticket
+    await ticket_history.create_index([
+        ("ticket_id", pymongo.ASCENDING),
+        ("changed_at", pymongo.DESCENDING)
+    ])
+    
+    # Query pattern: get history by external_id and tenant
+    await ticket_history.create_index([
+        ("tenant_id", pymongo.ASCENDING),
+        ("external_id", pymongo.ASCENDING),
+        ("changed_at", pymongo.DESCENDING)
+    ])
+    
+    # Query pattern: recent changes across tenant
+    await ticket_history.create_index([
+        ("tenant_id", pymongo.ASCENDING),
+        ("changed_at", pymongo.DESCENDING)
+    ])
 
 
 # ============================================================

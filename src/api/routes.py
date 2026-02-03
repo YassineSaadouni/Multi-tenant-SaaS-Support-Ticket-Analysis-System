@@ -42,21 +42,23 @@ async def list_tickets(
     query: dict = {}
 
     # ============================================================
-    # 🐛 DEBUG TASK A: Multi-tenant isolation bug
+    # 🐛 DEBUG TASK A: Multi-tenant isolation bug - FIXED
     # The tenant_id filter is missing here.
     # This can expose tickets that belong to other tenants.
     # ============================================================
-    # NOTE: initial starter implementation; you are expected to review and adjust
-    # the filtering and scoping as needed.
+    # Apply tenant isolation
+    if tenant_id:
+        query["tenant_id"] = tenant_id
+    
+    # Exclude soft-deleted tickets
+    query["deleted_at"] = {"$exists": False}
+    
     if status:
         query["status"] = status
     if urgency:
         query["urgency"] = urgency
     if source:
         query["source"] = source
-
-    # 🐛 TODO: Add tenant_id scoping to the query.
-    # 🐛 TODO: Filter out tickets with a non-null deleted_at (soft delete).
 
     # Execute query with timeout to prevent resource exhaustion
     try:
@@ -566,16 +568,56 @@ async def reset_circuit(name: str):
 # Ticket History API (Task 12)
 # ============================================================
 
-@router.get("/tickets/{ticket_id}/history")
+@router.get("/tickets/{external_id}/history")
 async def get_ticket_history(
-    ticket_id: str,
+    external_id: str,
     tenant_id: str,
     limit: int = Query(50, ge=1, le=200)
 ):
     """
-    Retrieve the change history for a ticket (Task 12).
+    Retrieve the field-level change history for a ticket.
+    Returns all recorded changes with timestamps and before/after values.
     """
-    from src.services.sync_service import SyncService
+    db = await get_db()
+    
+    # Get history entries for this ticket
+    history = await db.ticket_history.find({
+        "external_id": external_id,
+        "tenant_id": tenant_id
+    }).sort("changed_at", -1).limit(limit).to_list(length=limit)
+    
+    # Convert ObjectIds to strings for JSON serialization
+    for entry in history:
+        entry["_id"] = str(entry["_id"])
+        entry["ticket_id"] = str(entry["ticket_id"])
+        if entry.get("changed_at"):
+            entry["changed_at"] = entry["changed_at"].isoformat()
+        if entry.get("sync_timestamp"):
+            entry["sync_timestamp"] = entry["sync_timestamp"].isoformat()
+    
+    return {
+        "external_id": external_id,
+        "tenant_id": tenant_id,
+        "history_count": len(history),
+        "history": history
+    }
+
+
+@router.post("/sync/detect-deletions")
+async def detect_deleted_tickets(
+    tenant_id: str,
+    ingest_service: IngestService = Depends()
+):
+    """
+    Detect and soft-delete tickets that were deleted externally.
+    Compares local tickets against external API.
+    """
+    deleted_count = await ingest_service.detect_deleted_tickets(tenant_id)
+    return {
+        "tenant_id": tenant_id,
+        "deleted_count": deleted_count,
+        "message": f"Soft-deleted {deleted_count} tickets"
+    }
     sync_service = SyncService()
     history = await sync_service.get_ticket_history(ticket_id, tenant_id, limit)
     return {"ticket_id": ticket_id, "history": history}
