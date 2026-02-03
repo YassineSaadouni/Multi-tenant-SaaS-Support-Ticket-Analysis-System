@@ -30,48 +30,62 @@ class IngestService:
         Handles pagination, ensures idempotency, classifies tickets, and triggers notifications.
         Logs every run to ingestion_logs collection with full traceability.
         """
+        from pymongo.errors import DuplicateKeyError
+        
         db = await get_db()
         if job_id is None:
             job_id = str(uuid.uuid4())
         started_at = datetime.utcnow()
 
         # ============================================================
-        # 🐛 DEBUG TASK D: Race condition - FIXED
-        # Use atomic findOneAndUpdate to acquire lock
+        # RACE CONDITION FIX: Use atomic findOneAndUpdate
+        # 
+        # Previous bug: check-then-act pattern allowed race condition
+        #   1. find_one() - check if running job exists
+        #   2. insert_one() - create new job
+        #   Between steps 1 and 2, concurrent request could also pass check
+        #
+        # Fix: Single atomic operation that:
+        #   - Only creates job if no running job exists for this tenant
+        #   - Uses findOneAndUpdate with upsert for atomicity
         # ============================================================
-        job_doc = {
-            "tenant_id": tenant_id,
-            "job_id": job_id,
-            "status": "running",
-            "started_at": started_at,
-            "progress": 0,
-            "total_pages": None,
-            "processed_pages": 0,
-            "cancelled": False
-        }
         
-        # Atomic operation: only insert if no running job exists
-        try:
-            existing = await db.ingestion_jobs.find_one({
+        # Atomic operation: Create job only if no running job exists
+        # This uses a single atomic findOneAndUpdate to prevent race conditions
+        result = await db.ingestion_jobs.find_one_and_update(
+            {
                 "tenant_id": tenant_id,
                 "status": "running"
-            })
-            
-            if existing:
-                return {
-                    "status": "already_running",
-                    "job_id": str(existing.get("job_id", existing["_id"])),
-                    "new_ingested": 0,
-                    "updated": 0,
-                    "errors": 0
+            },
+            {
+                "$setOnInsert": {
+                    "tenant_id": tenant_id,
+                    "job_id": job_id,
+                    "status": "running",
+                    "started_at": started_at,
+                    "progress": 0,
+                    "total_pages": None,
+                    "processed_pages": 0,
+                    "cancelled": False
                 }
-            
-            result = await db.ingestion_jobs.insert_one(job_doc)
-            job_doc["_id"] = result.inserted_id
-            
-        except Exception as e:
-            logger.error(f"Failed to create job: {e}")
-            raise
+            },
+            upsert=True,
+            return_document=True
+        )
+        
+        # Check if we acquired the job or if another job was already running
+        if result.get("job_id") != job_id:
+            # Another job was already running - we didn't create a new one
+            return {
+                "status": "already_running",
+                "job_id": str(result.get("job_id", result["_id"])),
+                "new_ingested": 0,
+                "updated": 0,
+                "errors": 0
+            }
+        
+        # We successfully created and acquired the job
+        job_doc = result
 
         # Metrics tracking
         new_ingested = 0
