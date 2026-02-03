@@ -31,7 +31,7 @@ class LockService:
 
     async def acquire_lock(self, resource_id: str, owner_id: str) -> bool:
         """
-        Attempt to acquire a lock.
+        Attempt to acquire a lock using MongoDB atomic operations.
 
         Args:
             resource_id: ID of the resource to lock (e.g., tenant_id).
@@ -40,17 +40,76 @@ class LockService:
         Returns:
             True if lock acquired, False otherwise.
 
-        TODO: Implement:
-        - If a non-expired lock already exists, return False.
-        - If no lock or an expired lock exists, create/refresh a lock and return True.
-        - Use an atomic MongoDB operation.
+        Implementation:
+        - Uses findOneAndUpdate with atomic operations
+        - Only acquires if no lock exists OR existing lock is expired
+        - Sets TTL of 60 seconds to prevent deadlocks from crashed processes
         """
-        # TODO: implement
-        pass
+        from pymongo.errors import DuplicateKeyError
+        
+        db = await get_db()
+        now = datetime.utcnow()
+        expires_at = now + timedelta(seconds=self.LOCK_TTL_SECONDS)
+        
+        try:
+            # Atomic operation: only acquire if no lock exists or existing lock is expired
+            result = await db[self.LOCK_COLLECTION].find_one_and_update(
+                {
+                    "resource_id": resource_id,
+                    "$or": [
+                        {"expires_at": {"$lt": now}},  # Expired lock
+                        {"expires_at": {"$exists": False}}  # No expiration (shouldn't happen)
+                    ]
+                },
+                {
+                    "$set": {
+                        "resource_id": resource_id,
+                        "owner_id": owner_id,
+                        "acquired_at": now,
+                        "expires_at": expires_at,
+                        "last_refreshed_at": now
+                    }
+                },
+                upsert=True,
+                return_document=True  # Return the updated document
+            )
+        except DuplicateKeyError:
+            # Lock already exists and isn't expired - couldn't acquire
+            return False
+        
+        # Check if we successfully acquired the lock
+        if result and result.get("owner_id") == owner_id:
+            return True
+        
+        # Lock exists and is not expired - check if it belongs to another owner
+        existing_lock = await db[self.LOCK_COLLECTION].find_one({"resource_id": resource_id})
+        if existing_lock:
+            # Lock is held by someone else and hasn't expired
+            if existing_lock.get("expires_at", now) > now:
+                return False
+            # Lock expired, try to acquire it
+            result = await db[self.LOCK_COLLECTION].find_one_and_update(
+                {
+                    "resource_id": resource_id,
+                    "expires_at": {"$lt": now}
+                },
+                {
+                    "$set": {
+                        "owner_id": owner_id,
+                        "acquired_at": now,
+                        "expires_at": expires_at,
+                        "last_refreshed_at": now
+                    }
+                },
+                return_document=True
+            )
+            return result is not None and result.get("owner_id") == owner_id
+        
+        return False
 
     async def release_lock(self, resource_id: str, owner_id: str) -> bool:
         """
-        Release a lock.
+        Release a lock atomically.
 
         Args:
             resource_id: ID of the resource to unlock.
@@ -59,11 +118,19 @@ class LockService:
         Returns:
             True if lock released, False otherwise.
 
-        TODO: Implement:
-        - Only release the lock when `owner_id` matches the stored owner.
+        Implementation:
+        - Only releases if owner_id matches (prevents unauthorized release)
+        - Uses atomic delete operation
         """
-        # TODO: implement
-        pass
+        db = await get_db()
+        
+        # Only delete the lock if it's owned by the specified owner
+        result = await db[self.LOCK_COLLECTION].delete_one({
+            "resource_id": resource_id,
+            "owner_id": owner_id
+        })
+        
+        return result.deleted_count > 0
 
     async def refresh_lock(self, resource_id: str, owner_id: str) -> bool:
         """
@@ -76,11 +143,30 @@ class LockService:
         Returns:
             True if lock refreshed, False otherwise.
 
-        TODO: Implement:
-        - For long-running jobs, call this periodically to keep the lock alive.
+        Implementation:
+        - Extends expiration time by LOCK_TTL_SECONDS
+        - Only refreshes if owner_id matches
+        - Useful for long-running ingestion jobs
         """
-        # TODO: implement
-        pass
+        db = await get_db()
+        now = datetime.utcnow()
+        new_expires_at = now + timedelta(seconds=self.LOCK_TTL_SECONDS)
+        
+        # Only refresh if the lock is owned by the specified owner
+        result = await db[self.LOCK_COLLECTION].update_one(
+            {
+                "resource_id": resource_id,
+                "owner_id": owner_id
+            },
+            {
+                "$set": {
+                    "expires_at": new_expires_at,
+                    "last_refreshed_at": now
+                }
+            }
+        )
+        
+        return result.modified_count > 0
 
     async def get_lock_status(self, resource_id: str) -> Optional[dict]:
         """

@@ -231,38 +231,111 @@ async def get_tenant_stats(
 async def run_ingestion(
     tenant_id: str,
     background_tasks: BackgroundTasks,
-    ingest_service: IngestService = Depends()
+    ingest_service: IngestService = Depends(),
+    lock_service: LockService = Depends()
 ):
     """
     Trigger a ticket ingestion run for a tenant.
 
-    TODO: Implement:
-    - Task 8: Prevent concurrent ingestion using a distributed lock.
-    - If ingestion is already running for this tenant, return 409 Conflict.
+    Concurrency Control (Task 8):
+    - Uses distributed lock to prevent concurrent ingestion per tenant
+    - Returns 409 Conflict if ingestion already running
+    - Lock expires after 60 seconds to prevent deadlocks
     """
-    # TODO: Attempt to acquire a distributed lock before starting ingestion.
-    # lock_service = LockService()
-    # if not await lock_service.acquire_lock(f"ingest:{tenant_id}", job_id):
-    #     raise HTTPException(status_code=409, detail="Ingestion already running")
-
-    result = await ingest_service.run_ingestion(tenant_id)
-    return {"status": "ingestion_started", "result": result}
+    import uuid
+    
+    # Generate unique job ID for this ingestion
+    job_id = str(uuid.uuid4())
+    resource_id = f"ingest:{tenant_id}"
+    
+    # Attempt to acquire distributed lock
+    lock_acquired = await lock_service.acquire_lock(resource_id, job_id)
+    
+    if not lock_acquired:
+        # Check if there's an active lock
+        lock_status = await lock_service.get_lock_status(resource_id)
+        if lock_status and not lock_status["is_expired"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "Ingestion already running for this tenant",
+                    "tenant_id": tenant_id,
+                    "active_job_id": lock_status["owner_id"],
+                    "started_at": lock_status["acquired_at"].isoformat(),
+                    "expires_at": lock_status["expires_at"].isoformat()
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail="Failed to acquire lock. Please try again."
+            )
+    
+    # Lock acquired - run ingestion and ensure lock is released
+    try:
+        result = await ingest_service.run_ingestion(tenant_id)
+        return {"status": "ingestion_started", "result": result}
+    finally:
+        # Always release the lock, even if ingestion fails
+        await lock_service.release_lock(resource_id, job_id)
 
 
 @router.get("/ingest/status")
 async def get_ingestion_status(
     tenant_id: str,
-    ingest_service: IngestService = Depends()
+    ingest_service: IngestService = Depends(),
+    lock_service: LockService = Depends()
 ):
     """
     Get the current ingestion status for the given tenant (Task 8).
 
-    Returns the current ingestion job state for this tenant.
+    Returns comprehensive status including:
+    - Current lock status (if job is actively running)
+    - Last completed job details from ingestion_logs
+    - Whether a job is currently active
     """
-    status = await ingest_service.get_ingestion_status(tenant_id)
-    if not status:
-        return {"status": "idle", "tenant_id": tenant_id}
-    return status
+    from src.db.mongo import get_db
+    
+    resource_id = f"ingest:{tenant_id}"
+    
+    # Check if there's an active lock
+    lock_status = await lock_service.get_lock_status(resource_id)
+    
+    response = {
+        "tenant_id": tenant_id,
+        "is_running": False,
+        "current_job": None,
+        "last_completed": None
+    }
+    
+    # Check for active lock
+    if lock_status and not lock_status["is_expired"]:
+        response["is_running"] = True
+        response["current_job"] = {
+            "job_id": lock_status["owner_id"],
+            "started_at": lock_status["acquired_at"].isoformat(),
+            "expires_at": lock_status["expires_at"].isoformat(),
+            "status": "running"
+        }
+    
+    # Get last completed job from ingestion_logs
+    db = await get_db()
+    last_log = await db.ingestion_logs.find_one(
+        {"tenant_id": tenant_id},
+        sort=[("ended_at", -1)]
+    )
+    
+    if last_log:
+        response["last_completed"] = {
+            "job_id": last_log.get("job_id"),
+            "status": last_log.get("status"),
+            "started_at": last_log.get("started_at").isoformat() if last_log.get("started_at") else None,
+            "ended_at": last_log.get("ended_at").isoformat() if last_log.get("ended_at") else None,
+            "duration_seconds": last_log.get("duration_seconds"),
+            "metrics": last_log.get("metrics", {})
+        }
+    
+    return response
 
 
 @router.get("/ingest/progress/{job_id}")
@@ -342,10 +415,39 @@ async def cancel_ingestion(
 # ============================================================
 
 @router.get("/ingest/lock/{tenant_id}")
-async def get_lock_status(tenant_id: str):
+async def get_lock_status(
+    tenant_id: str,
+    lock_service: LockService = Depends()
+):
     """
     Get the current ingestion lock status for a tenant (Task 8).
+    
+    Returns detailed lock information including:
+    - Whether a lock exists
+    - Lock owner (job_id)
+    - Lock acquisition and expiration times
+    - Whether the lock has expired
     """
+    resource_id = f"ingest:{tenant_id}"
+    lock_status = await lock_service.get_lock_status(resource_id)
+    
+    if not lock_status:
+        return {
+            "tenant_id": tenant_id,
+            "locked": False,
+            "message": "No active lock for this tenant"
+        }
+    
+    return {
+        "tenant_id": tenant_id,
+        "locked": not lock_status["is_expired"],
+        "lock_details": {
+            "owner_id": lock_status["owner_id"],
+            "acquired_at": lock_status["acquired_at"].isoformat(),
+            "expires_at": lock_status["expires_at"].isoformat(),
+            "is_expired": lock_status["is_expired"]
+        }
+    }
     lock_service = LockService()
     status = await lock_service.get_lock_status(f"ingest:{tenant_id}")
     if not status:

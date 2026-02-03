@@ -81,6 +81,31 @@ async def create_indexes():
             unique=True,
             name="job_id_unique_idx"
         )
+    
+    # distributed_locks collection indexes (Task 8: Concurrency Control)
+    # Distributed locks for preventing concurrent ingestion per tenant
+    distributed_locks = db.distributed_locks
+    
+    # Unique index on resource_id - ensures only one lock per resource
+    await distributed_locks.create_index(
+        [("resource_id", pymongo.ASCENDING)],
+        unique=True,
+        name="resource_id_unique"
+    )
+    
+    # TTL index on expires_at - automatically cleanup expired locks
+    # MongoDB will delete documents where expires_at < current time
+    await distributed_locks.create_index(
+        [("expires_at", pymongo.ASCENDING)],
+        expireAfterSeconds=0,  # Delete immediately when expires_at is reached
+        name="expires_at_ttl"
+    )
+    
+    # Index on owner_id for lock ownership queries
+    await distributed_locks.create_index(
+        [("owner_id", pymongo.ASCENDING)],
+        name="owner_id_idx"
+    )
 
 
 # ============================================================
